@@ -446,6 +446,11 @@ fn main() -> Result<()> {
                 println!("  GPU: not found or error: {}", e);
             }
 
+            // Set MSI cooler fan to silent mode
+            if let Err(e) = msi_set_fan_mode(FanMode::Silent) {
+                println!("  MSI CORELIQUID fan: not found or error: {}", e);
+            }
+
             println!("\nDone!");
             Ok(())
         }
