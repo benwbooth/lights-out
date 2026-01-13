@@ -1,9 +1,9 @@
 [Unit]
-Description=MSI CORELIQUID temperature monitor for smart fan mode
+Description=MSI CORELIQUID temperature monitor (sends CPU temp to cooler)
 
 [Service]
 Type=simple
-ExecStart=/home/ben/src/lights-out/lights-out/target/release/lights-out daemon --smart
+ExecStart=/home/ben/src/lights-out/lights-out/target/release/lights-out daemon
 Restart=on-failure
 
 [Install]

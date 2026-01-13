@@ -113,12 +113,8 @@ enum Commands {
         #[arg(value_enum)]
         mode: FanMode,
     },
-    /// Run temperature monitoring daemon for MSI CORELIQUID smart fan mode
-    Daemon {
-        /// Also set fan mode to smart before starting daemon
-        #[arg(long, short)]
-        smart: bool,
-    },
+    /// Run temperature monitoring daemon for MSI CORELIQUID (sends CPU temp to cooler)
+    Daemon,
     /// Dump MSI cooler feature report (for debugging)
     Dump,
 }
@@ -240,16 +236,11 @@ fn send_cpu_temp(device: &HidDevice, temp: i32) -> Result<()> {
 }
 
 /// Run the temperature monitoring daemon
-fn msi_daemon(set_smart: bool, stop_flag: Arc<AtomicBool>) -> Result<()> {
+fn msi_daemon(stop_flag: Arc<AtomicBool>) -> Result<()> {
     let api = HidApi::new().context("Failed to initialize HID API")?;
     let device = api
         .open(msi::VID, msi::PID)
         .context("Failed to open MSI CORELIQUID")?;
-
-    // Optionally set smart mode first
-    if set_smart {
-        msi_set_fan_mode(FanMode::Smart)?;
-    }
 
     // Find the CPU temperature sensor
     let temp_path = find_cpu_temp_path()?;
@@ -470,7 +461,7 @@ fn main() -> Result<()> {
             println!("Setting MSI CORELIQUID fan mode...");
             msi_set_fan_mode(mode)
         }
-        Commands::Daemon { smart } => {
+        Commands::Daemon => {
             println!("Starting MSI CORELIQUID temperature daemon...");
 
             // Set up signal handler for graceful shutdown
@@ -483,7 +474,7 @@ fn main() -> Result<()> {
             })
             .context("Failed to set signal handler")?;
 
-            msi_daemon(smart, stop_flag)
+            msi_daemon(stop_flag)
         }
         Commands::Dump => msi_dump(),
     }
