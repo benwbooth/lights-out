@@ -1,0 +1,11 @@
+[Unit]
+Description=Turn off RGB lights
+After=openrgb.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/ben/src/lights-out/lights-out.sh
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

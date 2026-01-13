@@ -1,0 +1,14 @@
+# Rust build artifacts
+target/
+
+# Nix result symlink
+result
+
+# Editor files
+*.swp
+*~
+.idea/
+.vscode/
+
+# OS files
+.DS_Store

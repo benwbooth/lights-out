@@ -1,0 +1,10 @@
+[Unit]
+Description=MSI CORELIQUID temperature monitor for smart fan mode
+
+[Service]
+Type=simple
+ExecStart=/home/ben/src/lights-out/lights-out/target/release/lights-out daemon --smart
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
