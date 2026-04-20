@@ -21,25 +21,22 @@ fi
 echo ""
 echo "[OpenRGB] Detected devices..."
 
-# Device 0: Corsair Dominator Platinum (RAM stick 1) - set to black
-echo "  [0] Corsair RAM (stick 1) -> black"
+# Address devices by name — indices shift when things like the DualSense
+# controller connect/disconnect.
+
+echo "  Corsair RAM (stick 1) -> black"
 openrgb --device 0 --mode Direct --color 000000
 
-# Device 1: Corsair Dominator Platinum (RAM stick 2) - set to black
-echo "  [1] Corsair RAM (stick 2) -> black"
+echo "  Corsair RAM (stick 2) -> black"
 openrgb --device 1 --mode Direct --color 000000
 
-# Device 2: Asus ROG Chakram X (Mouse) - set to black
-echo "  [2] ASUS ROG Chakram X mouse -> black"
-openrgb --device 2 --mode Direct --color 000000
+echo "  ASUS ROG Chakram X mouse -> black"
+openrgb --device "Asus ROG Chakram X 2.4GHz" --mode Direct --color 000000
 
-# Device 3: Red Square Keyrox TKL Classic (Keyboard)
-# NOTE: OpenRGB can't fully control this keyboard's backlight
-echo "  [3] Red Square Keyrox keyboard -> (use Fn+Del manually)"
+echo "  Red Square Keyrox keyboard -> (use Fn+Del manually)"
 
-# Device 4: ASRock X670E Taichi (Motherboard) - has Off mode
-echo "  [4] ASRock X670E Taichi motherboard -> off"
-openrgb --device 4 --mode Off
+echo "  ASRock X670E Taichi motherboard -> off"
+openrgb --device "ASRock X670E Taichi" --mode Off
 
 echo ""
 echo "=== Summary ==="
