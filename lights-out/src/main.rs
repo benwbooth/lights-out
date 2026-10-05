@@ -352,10 +352,13 @@ fn read_cooler_report(device: &HidDevice, command: u8) -> Result<Vec<u8>> {
     request[0] = msi::CMD_PREFIX;
     request[1] = command;
     write_report(device, &request)?;
+    // Both configuration queries reply with 0x32, including the 0x33
+    // temperature query (confirmed by the MSI protocol and device readback).
+    let reply_command = if command == 0x33 { 0x32 } else { command };
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         let length = device.read_timeout(&mut response, 200)?;
-        if length >= 2 && response[0] == msi::CMD_PREFIX && response[1] == command {
+        if length >= 2 && response[0] == msi::CMD_PREFIX && response[1] == reply_command {
             return Ok(response[..length].to_vec());
         }
     }
