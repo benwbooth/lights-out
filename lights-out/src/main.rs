@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use hidapi::{HidApi, HidDevice};
 use i2cdev::core::I2CDevice;
@@ -7,7 +7,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod cooling;
+use cooling::CoolingPolicy;
 
 // MSI MPG CORELIQUID
 mod msi {
@@ -15,7 +18,7 @@ mod msi {
     pub const PID: u16 = 0xb130;
     pub const FEATURE_REPORT_ID: u8 = 0x52;
     pub const MAX_DATA_LEN: usize = 185;
-    pub const HID_REPORT_LEN: usize = 65; // 64 bytes + report ID
+    pub const HID_REPORT_LEN: usize = 64; // Includes the 0xD0 report ID
     pub const CMD_PREFIX: u8 = 0xD0;
     pub const CMD_LCD_DISABLE: u8 = 0x7F;
     pub const LED_MODE_DISABLE: u8 = 0;
@@ -31,7 +34,7 @@ mod msi {
     pub const FAN_MODE_OFFSETS: &[usize] = &[2, 10, 18, 26, 34];
 
     // Daemon polling interval in seconds
-    pub const DAEMON_INTERVAL_SECS: u64 = 2;
+    pub const DAEMON_INTERVAL_SECS: u64 = 1;
 
     pub const LED_OFFSETS: &[usize] = &[
         1, 11, 21, 31, 42, 53, 74, 84, 94, 104, 114, 124, 134, 144, 154, 164, 174,
@@ -39,7 +42,7 @@ mod msi {
 }
 
 /// Fan modes for MSI CORELIQUID AIO cooler
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum FanMode {
     /// Silent mode - quietest, lower cooling
     Silent = 0,
@@ -47,6 +50,8 @@ pub enum FanMode {
     Balance = 1,
     /// Game mode - higher cooling, more noise
     Game = 2,
+    /// Fixed 100% duty on all cooler fans and the pump
+    Full = 3,
     /// Default mode - constant speed
     Default = 4,
     /// Smart mode - adapts to CPU temperature
@@ -113,8 +118,10 @@ enum Commands {
         #[arg(value_enum)]
         mode: FanMode,
     },
-    /// Run temperature monitoring daemon for MSI CORELIQUID (sends CPU temp to cooler)
+    /// Keep the cooler silent normally and increase cooling when the CPU is hot
     Daemon,
+    /// Read cooler fan/pump RPM, duty and configured modes
+    Status,
     /// Dump MSI cooler feature report (for debugging)
     Dump,
 }
@@ -158,27 +165,45 @@ fn msi_set_fan_mode(mode: FanMode) -> Result<()> {
         .open(msi::VID, msi::PID)
         .context("Failed to open MSI CORELIQUID")?;
 
-    let mode_val = mode as u8;
+    set_fan_mode(&device, mode)
+}
 
-    // Build command buffer with mode at specific offsets
-    let mut buf = [0u8; msi::HID_REPORT_LEN];
-    buf[0] = msi::CMD_PREFIX;
-    buf[1] = msi::CMD_FAN_MODE_1;
-    for &offset in msi::FAN_MODE_OFFSETS {
-        buf[offset] = mode_val;
+// Protocol reference: liquidctl/docs/developer/protocol/coreliquid.md.
+// Mode 3 is custom: Full supplies seven 100% duty points and zero temperatures.
+fn fan_mode_reports(mode: FanMode) -> [[u8; msi::HID_REPORT_LEN]; 2] {
+    let mut reports = [[0u8; msi::HID_REPORT_LEN]; 2];
+    for (report, command) in reports
+        .iter_mut()
+        .zip([msi::CMD_FAN_MODE_1, msi::CMD_FAN_MODE_2])
+    {
+        report[0] = msi::CMD_PREFIX;
+        report[1] = command;
+        for &offset in msi::FAN_MODE_OFFSETS {
+            report[offset] = mode as u8;
+            if mode == FanMode::Full && command == msi::CMD_FAN_MODE_1 {
+                report[offset + 1..offset + 8].fill(100);
+            }
+        }
     }
+    reports
+}
 
-    // Send first command (0x40)
-    device
-        .write(&buf)
-        .context("Failed to write fan mode command 0x40")?;
+fn write_report(device: &HidDevice, report: &[u8]) -> Result<()> {
+    let written = device
+        .write(report)
+        .context("Failed to write cooler command")?;
+    ensure!(
+        written == report.len(),
+        "Short cooler command write: {written}/{}",
+        report.len()
+    );
+    Ok(())
+}
 
-    // Send second command (0x41)
-    buf[1] = msi::CMD_FAN_MODE_2;
-    device
-        .write(&buf)
-        .context("Failed to write fan mode command 0x41")?;
-
+fn set_fan_mode(device: &HidDevice, mode: FanMode) -> Result<()> {
+    for report in fan_mode_reports(mode) {
+        write_report(device, &report)?;
+    }
     println!("  MSI CORELIQUID: Fan mode set to {:?}", mode);
     Ok(())
 }
@@ -209,11 +234,18 @@ fn find_cpu_temp_path() -> Result<std::path::PathBuf> {
     anyhow::bail!("CPU temperature sensor not found (looking for k10temp or coretemp)")
 }
 
-/// Read CPU temperature in degrees Celsius
+/// Read CPU temperature in millidegrees Celsius, without rounding thresholds.
 fn read_cpu_temp(temp_path: &Path) -> Result<i32> {
     let content = fs::read_to_string(temp_path).context("Failed to read temperature")?;
-    let millidegrees: i32 = content.trim().parse().context("Failed to parse temperature")?;
-    Ok(millidegrees / 1000)
+    let millidegrees: i32 = content
+        .trim()
+        .parse()
+        .context("Failed to parse temperature")?;
+    ensure!(
+        (0..=150_000).contains(&millidegrees),
+        "Invalid CPU temperature: {millidegrees}"
+    );
+    Ok(millidegrees)
 }
 
 /// Send CPU temperature to the AIO
@@ -231,7 +263,7 @@ fn send_cpu_temp(device: &HidDevice, temp: i32) -> Result<()> {
     buf[4] = (temp & 0xFF) as u8;
     buf[5] = ((temp >> 8) & 0xFF) as u8;
 
-    device.write(&buf).context("Failed to send CPU temperature")?;
+    write_report(device, &buf).context("Failed to send CPU temperature")?;
     Ok(())
 }
 
@@ -242,22 +274,53 @@ fn msi_daemon(stop_flag: Arc<AtomicBool>) -> Result<()> {
         .open(msi::VID, msi::PID)
         .context("Failed to open MSI CORELIQUID")?;
 
-    // Find the CPU temperature sensor
-    let temp_path = find_cpu_temp_path()?;
+    // Never leave a cooler at a quiet setting if the sensor cannot be found.
+    let temp_path = match find_cpu_temp_path() {
+        Ok(path) => path,
+        Err(error) => {
+            set_fan_mode(&device, FanMode::Full)?;
+            return Err(error);
+        }
+    };
     println!("  Found CPU temp sensor: {}", temp_path.display());
-    println!("  Starting temperature monitoring (Ctrl+C to stop)...");
+    println!("  Cooling policy: Silent normally; Game at 80°C; Full at 85°C; Silent again after 30 seconds below 70°C");
 
-    // Main loop
+    let started = Instant::now();
+    let mut policy = CoolingPolicy::default();
+    let mut applied_mode = None;
+    let mut last_applied = Instant::now();
+    let mut last_logged = Instant::now();
+
     while !stop_flag.load(Ordering::Relaxed) {
-        match read_cpu_temp(&temp_path) {
-            Ok(temp) => {
-                println!("  CPU Temperature: {}°C", temp);
-                if let Err(e) = send_cpu_temp(&device, temp) {
-                    eprintln!("  Warning: Failed to send temperature: {}", e);
+        let temperature = read_cpu_temp(&temp_path);
+        let mode = policy.update(temperature.as_ref().ok().copied(), started.elapsed());
+        let changed = applied_mode != Some(mode);
+        // Periodically reassert the policy after another program changes modes.
+        if changed || last_applied.elapsed() >= Duration::from_secs(10) {
+            if let Err(error) = set_fan_mode(&device, mode) {
+                let _ = set_fan_mode(&device, FanMode::Full);
+                return Err(error);
+            }
+            applied_mode = Some(mode);
+            last_applied = Instant::now();
+        }
+        match temperature {
+            Ok(millidegrees) => {
+                if changed || last_logged.elapsed() >= Duration::from_secs(10) {
+                    println!(
+                        "  CPU Temperature: {:.1}°C; cooling: {mode:?}",
+                        millidegrees as f64 / 1000.0
+                    );
+                    last_logged = Instant::now();
+                }
+                if let Err(error) = send_cpu_temp(&device, millidegrees / 1000) {
+                    let _ = set_fan_mode(&device, FanMode::Full);
+                    return Err(error);
                 }
             }
-            Err(e) => {
-                eprintln!("  Warning: Failed to read temperature: {}", e);
+            Err(error) => {
+                // Systemd retries sensor discovery, while full speed remains set.
+                return Err(error);
             }
         }
 
@@ -270,7 +333,69 @@ fn msi_daemon(stop_flag: Arc<AtomicBool>) -> Result<()> {
         }
     }
 
-    println!("  Daemon stopped.");
+    // A stopped daemon cannot keep providing fresh temperatures. Use a fixed
+    // duty that does not depend on the last (possibly cool) temperature sample.
+    set_fan_mode(&device, FanMode::Full)?;
+    println!("  Daemon stopped; cooler left at full speed.");
+    Ok(())
+}
+
+fn read_cooler_report(device: &HidDevice, command: u8) -> Result<Vec<u8>> {
+    // Discard old replies, with a bound in case a device continuously reports.
+    let mut response = [0u8; msi::HID_REPORT_LEN];
+    for _ in 0..32 {
+        if device.read_timeout(&mut response, 0)? == 0 {
+            break;
+        }
+    }
+    let mut request = [0u8; msi::HID_REPORT_LEN];
+    request[0] = msi::CMD_PREFIX;
+    request[1] = command;
+    write_report(device, &request)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let length = device.read_timeout(&mut response, 200)?;
+        if length >= 2 && response[0] == msi::CMD_PREFIX && response[1] == command {
+            return Ok(response[..length].to_vec());
+        }
+    }
+    anyhow::bail!("Timed out reading cooler report 0x{command:02x}")
+}
+
+fn msi_status() -> Result<()> {
+    let api = HidApi::new().context("Failed to initialize HID API")?;
+    let device = api
+        .open(msi::VID, msi::PID)
+        .context("Failed to open MSI CORELIQUID")?;
+    let status = read_cooler_report(&device, 0x31)?;
+    let speeds = read_cooler_report(&device, 0x32)?;
+    let temperatures = read_cooler_report(&device, 0x33)?;
+    ensure!(
+        status.len() >= 32 && speeds.len() >= 42 && temperatures.len() >= 42,
+        "Short cooler status reply"
+    );
+    // Channel order follows the liquidctl MSI driver (the protocol document's
+    // pump/waterblock labels are reversed).
+    for (index, name) in [
+        "Radiator fan 1",
+        "Radiator fan 2",
+        "Radiator fan 3",
+        "Waterblock fan",
+        "Pump",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let rpm_offset = 2 + index * 2;
+        let duty_offset = 22 + index * 2;
+        let mode_offset = 2 + index * 8;
+        let rpm = u16::from_le_bytes([status[rpm_offset], status[rpm_offset + 1]]);
+        let duty = u16::from_le_bytes([status[duty_offset], status[duty_offset + 1]]);
+        println!(
+            "  {name}: {rpm} RPM, {duty}% duty, speed mode {}, temperature mode {}",
+            speeds[mode_offset], temperatures[mode_offset]
+        );
+    }
     Ok(())
 }
 
@@ -296,7 +421,7 @@ fn lianli_disable() -> Result<()> {
         let mut color_packet = [0u8; lianli::COLOR_PACKET_SIZE];
         color_packet[0] = lianli::TRANSACTION_ID;
         color_packet[1] = 0x30 + (channel * 2); // Fan LEDs
-        // Rest is zeros (black RGB)
+                                                // Rest is zeros (black RGB)
         match device.write(&color_packet) {
             Ok(_) => {}
             Err(e) => eprintln!("    Warning: color packet ch{} fan failed: {}", channel, e),
@@ -437,11 +562,6 @@ fn main() -> Result<()> {
                 println!("  GPU: not found or error: {}", e);
             }
 
-            // Set MSI cooler fan to silent mode
-            if let Err(e) = msi_set_fan_mode(FanMode::Silent) {
-                println!("  MSI CORELIQUID fan: not found or error: {}", e);
-            }
-
             println!("\nDone!");
             Ok(())
         }
@@ -477,5 +597,37 @@ fn main() -> Result<()> {
             msi_daemon(stop_flag)
         }
         Commands::Dump => msi_dump(),
+        Commands::Status => msi_status(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emergency_mode_sets_every_duty_point_to_full() {
+        let [speeds, temperatures] = fan_mode_reports(FanMode::Full);
+        assert_eq!(&speeds[..2], &[0xd0, 0x40]);
+        assert_eq!(&temperatures[..2], &[0xd0, 0x41]);
+        for offset in [2, 10, 18, 26, 34] {
+            assert_eq!(
+                &speeds[offset..offset + 8],
+                &[3, 100, 100, 100, 100, 100, 100, 100]
+            );
+            assert_eq!(&temperatures[offset..offset + 8], &[3, 0, 0, 0, 0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn preset_modes_keep_the_firmware_curve() {
+        for mode in [FanMode::Silent, FanMode::Game] {
+            for report in fan_mode_reports(mode) {
+                for offset in [2, 10, 18, 26, 34] {
+                    assert_eq!(report[offset], mode as u8);
+                    assert_eq!(&report[offset + 1..offset + 8], &[0; 7]);
+                }
+            }
+        }
     }
 }

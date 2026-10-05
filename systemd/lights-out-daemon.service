@@ -1,10 +1,13 @@
 [Unit]
-Description=MSI CORELIQUID temperature monitor (sends CPU temp to cooler)
+Description=MSI CORELIQUID quiet cooling with thermal override
+After=lights-out.service
 
 [Service]
 Type=simple
 ExecStart=/home/ben/src/lights-out/lights-out/target/release/lights-out daemon
+ExecStopPost=/home/ben/src/lights-out/lights-out/target/release/lights-out fan full
 Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
