@@ -283,7 +283,7 @@ fn msi_daemon(stop_flag: Arc<AtomicBool>) -> Result<()> {
         }
     };
     println!("  Found CPU temp sensor: {}", temp_path.display());
-    println!("  Cooling policy: Silent normally; Game at 80°C; Full at 85°C; Silent again after 30 seconds below 70°C");
+    println!("  Cooling policy: Silent normally; Game at 80°C; Full at 85°C; Full to Game after 10 seconds below 80°C; Game to Silent after 15 seconds below 75°C");
 
     let started = Instant::now();
     let mut policy = CoolingPolicy::default();

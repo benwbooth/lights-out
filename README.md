@@ -12,11 +12,14 @@ selects cooling automatically:
 | Normal operation below 80°C | Silent |
 | CPU reaches 80°C | Game preset, immediately |
 | CPU reaches 85°C | Fixed 100% on all cooler fans and the pump, immediately |
-| CPU stays below 70°C for 30 seconds | Return to Silent |
+| In Full, CPU stays below 80°C for 10 seconds | Step down to Game |
+| In Game, CPU stays below 75°C for 15 seconds | Return to Silent |
 | CPU sensor unavailable or invalid | Fixed 100%, then exit for service restart |
 
-Elevated cooling stays enabled throughout the cooldown period, including full
-speed after an emergency. This avoids repeated noise changes near a threshold.
+Cooling steps down in stages after sustained recovery, with separate thresholds
+for heating and cooling to avoid repeated noise changes. A new hot sample always
+escalates immediately. Full speed no longer stays latched through ordinary
+70–79°C workloads after a brief spike.
 The defaults provide headroom below the Ryzen 9 7900X3D's 89°C operating limit;
 they cannot compensate for a failed pump, blocked airflow or poor cooler contact.
 
