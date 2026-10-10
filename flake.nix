@@ -71,7 +71,7 @@
             Type=Application
             Name=$title
             Comment=$comment
-            Exec=${pkgs.polkit}/bin/pkexec $out/bin/lights-out mode $mode
+            Exec=pkexec $out/bin/lights-out mode $mode
             Icon=preferences-system-power-management
             Categories=Settings;HardwareSettings;
             Terminal=false
