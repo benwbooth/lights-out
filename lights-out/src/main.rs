@@ -326,6 +326,7 @@ fn msi_daemon(stop_flag: Arc<AtomicBool>) -> Result<()> {
                     (balanced.update(sample, started.elapsed()), QUIET_MIN_KHZ)
                 }
             };
+            let fan_changed = applied_fan != Some(fan);
             // Emergency cooling must not wait for D-Bus/profile commands.
             if fan == FanMode::Full && applied_fan != Some(FanMode::Full) {
                 set_fan_mode(&device, FanMode::Full)?;
@@ -343,8 +344,9 @@ fn msi_daemon(stop_flag: Arc<AtomicBool>) -> Result<()> {
                 last_profile_check = Instant::now();
             }
             cpu.apply_limit(selected, quiet_limit)?;
-            let fan_changed = applied_fan != Some(fan);
-            if fan_changed || last_applied.elapsed() >= Duration::from_secs(10) {
+            if (fan_changed && fan != FanMode::Full)
+                || last_applied.elapsed() >= Duration::from_secs(10)
+            {
                 set_fan_mode(&device, fan)?;
                 applied_fan = Some(fan);
                 last_applied = Instant::now();
