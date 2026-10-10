@@ -54,6 +54,29 @@
 
             # Install the Rust binary
             cp ${lights-out-bin}/bin/lights-out $out/bin/lights-out
+            wrapProgram $out/bin/lights-out \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.power-profiles-daemon ]}
+
+            mkdir -p $out/share/applications
+            for mode in quiet balanced; do
+              if [ "$mode" = quiet ]; then
+                title="Quiet Cooling"
+                comment="Fixed low fan speeds; reduce CPU speed to stay cool"
+              else
+                title="Balanced Cooling"
+                comment="Full CPU performance; increase cooling when needed"
+              fi
+              cat > $out/share/applications/lights-out-$mode.desktop <<EOF
+            [Desktop Entry]
+            Type=Application
+            Name=$title
+            Comment=$comment
+            Exec=${pkgs.polkit}/bin/pkexec $out/bin/lights-out mode $mode
+            Icon=preferences-system-power-management
+            Categories=Settings;HardwareSettings;
+            Terminal=false
+            EOF
+            done
 
             # Install the wrapper script with proper paths
             substitute lights-out.sh $out/bin/lights-out.sh \

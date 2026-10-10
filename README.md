@@ -2,41 +2,57 @@
 
 Turns off component lighting and controls an MSI MPG CORELIQUID K360 cooler.
 
-## Quiet cooling with a thermal override
+## Two cooling modes
 
-`lights-out daemon` sends the CPU temperature to the cooler every second and
-selects cooling automatically:
+**Quiet is the default after each boot.** It keeps the radiator fans at a fixed
+35%, waterblock fan at 25%, and pump at 70%. CPU power saving and a 3.6 GHz ceiling
+reduce heat at its source. At 68°C the controller starts lowering that ceiling;
+at 75°C it allows at most 1.2 GHz, and at 80°C at most 800 MHz. It slowly restores
+speed after sustained cooling below 60°C. Normal workloads never select the
+Game or Full fan presets in Quiet mode; performance gives way to low noise.
 
-| Condition | Cooler mode |
-| --- | --- |
-| Normal operation below 80°C | Silent |
-| CPU reaches 80°C | Game preset, immediately |
-| CPU reaches 85°C | Fixed 100% on all cooler fans and the pump, immediately |
-| In Full, CPU stays below 80°C for 10 seconds | Step down to Game |
-| In Game, CPU stays below 75°C for 15 seconds | Return to Silent |
-| CPU sensor unavailable or invalid | Fixed 100%, then exit for service restart |
+**Balanced** restores the CPU's full supported frequency range and normal
+Balanced power profile. The cooler uses Silent normally, Game at 80°C, and
+fixed Full at 85°C. Full steps down to Game after 10 continuous seconds below
+80°C; Game returns to Silent after 15 seconds below 75°C.
 
-Cooling steps down in stages after sustained recovery, with separate thresholds
-for heating and cooling to avoid repeated noise changes. A new hot sample always
-escalates immediately. Full speed no longer stays latched through ordinary
-70–79°C workloads after a brief spike.
-The defaults provide headroom below the Ryzen 9 7900X3D's 89°C operating limit;
-they cannot compensate for a failed pump, blocked airflow or poor cooler contact.
+Select **Quiet Cooling** or **Balanced Cooling** from the application menu,
+or use:
 
-The daemon leaves the cooler at fixed full speed on graceful shutdown. The
-systemd unit also applies full speed after a crash or forced stop. The cooler
-needs fresh CPU temperatures for its preset curves; a stopped process must not
-leave it using a stale cool sample. USB communication failures may prevent any
-software override from reaching the hardware.
+```sh
+sudo lights-out mode quiet
+sudo lights-out mode balanced
+lights-out mode                 # selected mode and last daemon report
+sudo lights-out status          # actual fan/pump RPM, duty and configuration
+```
 
-`lights-out off` only changes lighting. It no longer forces Silent mode over an
-active thermal override. The daemon periodically reapplies its selected mode,
-so manual fan settings are temporary while the daemon runs.
+Changes take effect on the daemon's next polling interval, without a restart.
+The selection is stored in `/run/lights-out/mode`: it survives a service restart
+and resets to Quiet on reboot. Install the package system-wide to expose the
+commands and application-menu entries. The daemon must be running for selections
+to take effect. It owns the CPU power profile and frequency limits; use these
+mode controls instead of changing the desktop's power-profile slider separately.
 
-Read actual RPM, duty and configuration with `sudo lights-out status`. Mode IDs
-are 0 (Silent), 2 (Game), and 3 (custom, used here for fixed 100%). This readback is
-useful for checking that commands reached the cooler; temperature and physical
-cooling performance still need to be checked under the user's normal workload.
+### Safety boundary
+
+Quiet holds fixed low cooler speeds in normal operation. An actual **85°C
+emergency**, missing/invalid sensor, CPU-control failure, or daemon failure still
+requests full cooling. Software cannot promise silence during a cooling fault
+without risking another thermal shutdown. Quiet emergency recovery requires ten
+seconds below 70°C before returning to the low fixed speeds. GPU and case fans
+outside the MSI cooler are not controlled by these modes.
+
+The daemon sends the real CPU temperature every second, verifies frequency
+limits each cycle, and reasserts cooling/profile selection periodically. Profile
+commands have bounded execution time. If CPU control fails, it attempts an
+800 MHz ceiling and full cooling before systemd restarts it. Graceful shutdown
+and `ExecStopPost` also leave the cooler at fixed Full, since a stopped daemon
+cannot provide fresh temperature samples. USB failures can prevent commands
+from reaching the cooler; software cannot compensate for failed hardware.
+
+`lights-out off` only changes lighting. Manual low-level `fan` settings are
+temporary while the daemon runs. Hardware mode IDs are 0 (Silent), 2 (Game),
+and 3 (custom, used for both Quiet's fixed duties and emergency Full).
 
 ## Build and service
 
@@ -47,7 +63,10 @@ nix build .#default --cores 2 --max-jobs 1
 
 The example systemd units use the source checkout's release binary. NixOS should
 instead point both `ExecStart` and `ExecStopPost` to the built package, with
-`After=lights-out.service`, `Restart=on-failure`, and `RestartSec=2`.
+`After=lights-out.service power-profiles-daemon.service`, `Restart=on-failure`,
+`RestartSec=2`, `RuntimeDirectory=lights-out`, and
+`RuntimeDirectoryPreserve=restart`. The packaged wrapper supplies
+`powerprofilesctl` and `timeout` on PATH; source builds need those tools installed.
 
 The MSI packet formats and channel order follow the
 [liquidctl MSI driver](https://github.com/liquidctl/liquidctl/blob/main/liquidctl/driver/msi.py)

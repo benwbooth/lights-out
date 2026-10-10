@@ -1,6 +1,7 @@
 [Unit]
-Description=MSI CORELIQUID quiet cooling with thermal override
-After=lights-out.service
+Description=MSI CORELIQUID Quiet and Balanced cooling
+After=lights-out.service power-profiles-daemon.service
+Wants=power-profiles-daemon.service
 
 [Service]
 Type=simple
@@ -8,6 +9,8 @@ ExecStart=/home/ben/src/lights-out/lights-out/target/release/lights-out daemon
 ExecStopPost=/home/ben/src/lights-out/lights-out/target/release/lights-out fan full
 Restart=on-failure
 RestartSec=2
+RuntimeDirectory=lights-out
+RuntimeDirectoryPreserve=restart
 
 [Install]
 WantedBy=multi-user.target

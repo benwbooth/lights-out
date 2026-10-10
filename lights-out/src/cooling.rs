@@ -1,6 +1,77 @@
 use crate::FanMode;
 use std::time::Duration;
 
+pub const QUIET_MAX_KHZ: u32 = 3_600_000;
+pub const QUIET_MIN_KHZ: u32 = 800_000;
+
+/// Quiet sheds CPU performance before changing fan speed. The emergency
+/// override is reserved for an unsafe temperature or a failed sensor.
+pub struct QuietPolicy {
+    limit: u32,
+    emergency: bool,
+    recovered_since: Option<Duration>,
+    cool_since: Option<Duration>,
+}
+
+impl Default for QuietPolicy {
+    fn default() -> Self {
+        Self {
+            limit: QUIET_MAX_KHZ,
+            emergency: false,
+            recovered_since: None,
+            cool_since: None,
+        }
+    }
+}
+
+impl QuietPolicy {
+    pub fn update(&mut self, temperature: Option<i32>, now: Duration) -> (FanMode, u32) {
+        let Some(temperature) = temperature.filter(|value| (0..85_000).contains(value)) else {
+            self.limit = QUIET_MIN_KHZ;
+            self.emergency = true;
+            self.recovered_since = None;
+            self.cool_since = None;
+            return (FanMode::Full, self.limit);
+        };
+        if self.emergency {
+            if temperature < 70_000 {
+                let since = self.recovered_since.get_or_insert(now);
+                if now.saturating_sub(*since) >= Duration::from_secs(10) {
+                    self.emergency = false;
+                    self.recovered_since = None;
+                }
+            } else {
+                self.recovered_since = None;
+            }
+        }
+
+        if temperature >= 80_000 {
+            self.limit = QUIET_MIN_KHZ;
+        } else if temperature >= 75_000 {
+            self.limit = self.limit.min(1_200_000);
+        } else if temperature >= 68_000 {
+            self.limit = self.limit.saturating_sub(400_000).max(QUIET_MIN_KHZ);
+        }
+        if temperature < 60_000 && !self.emergency {
+            let since = self.cool_since.get_or_insert(now);
+            if now.saturating_sub(*since) >= Duration::from_secs(10) {
+                self.limit = (self.limit + 200_000).min(QUIET_MAX_KHZ);
+                self.cool_since = Some(now);
+            }
+        } else {
+            self.cool_since = None;
+        }
+        (
+            if self.emergency {
+                FanMode::Full
+            } else {
+                FanMode::Quiet
+            },
+            self.limit,
+        )
+    }
+}
+
 /// Escalate immediately; only reduce cooling after a sustained cool interval.
 /// Temperature thresholds are in millidegrees Celsius and elapsed time is
 /// monotonic. Invalid/missing samples always request fixed full speed.
@@ -54,6 +125,84 @@ impl CoolingPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_warm_load_reduces_cpu_instead_of_raising_fans() {
+        let mut policy = QuietPolicy::default();
+        assert_eq!(
+            policy.update(Some(55_000), Duration::ZERO),
+            (FanMode::Quiet, 3_600_000)
+        );
+        assert_eq!(
+            policy.update(Some(68_000), Duration::from_secs(1)),
+            (FanMode::Quiet, 3_200_000)
+        );
+        assert_eq!(
+            policy.update(Some(70_000), Duration::from_secs(2)),
+            (FanMode::Quiet, 2_800_000)
+        );
+        assert_eq!(
+            policy.update(Some(75_000), Duration::from_secs(3)),
+            (FanMode::Quiet, 1_200_000)
+        );
+        assert_eq!(
+            policy.update(Some(84_999), Duration::from_secs(4)),
+            (FanMode::Quiet, 800_000)
+        );
+        assert_eq!(
+            policy.update(Some(59_000), Duration::from_secs(5)),
+            (FanMode::Quiet, 800_000)
+        );
+        assert_eq!(
+            policy.update(Some(59_000), Duration::from_secs(14)),
+            (FanMode::Quiet, 800_000)
+        );
+        assert_eq!(
+            policy.update(Some(59_000), Duration::from_secs(15)),
+            (FanMode::Quiet, 1_000_000)
+        );
+        assert_eq!(
+            policy.update(Some(62_000), Duration::from_secs(16)),
+            (FanMode::Quiet, 1_000_000)
+        );
+        assert_eq!(
+            policy.update(Some(59_000), Duration::from_secs(26)),
+            (FanMode::Quiet, 1_000_000)
+        );
+    }
+
+    #[test]
+    fn quiet_emergency_requires_sustained_recovery_and_limits_cpu() {
+        let mut policy = QuietPolicy::default();
+        assert_eq!(
+            policy.update(Some(85_000), Duration::ZERO),
+            (FanMode::Full, 800_000)
+        );
+        assert_eq!(
+            policy.update(Some(69_000), Duration::from_secs(1)),
+            (FanMode::Full, 800_000)
+        );
+        assert_eq!(
+            policy.update(Some(70_000), Duration::from_secs(11)),
+            (FanMode::Full, 800_000)
+        );
+        assert_eq!(
+            policy.update(Some(55_000), Duration::from_secs(12)),
+            (FanMode::Full, 800_000)
+        );
+        assert_eq!(
+            policy.update(Some(55_000), Duration::from_secs(22)),
+            (FanMode::Quiet, 800_000)
+        );
+        assert_eq!(
+            policy.update(None, Duration::from_secs(23)),
+            (FanMode::Full, 800_000)
+        );
+        assert_eq!(
+            policy.update(Some(-1), Duration::from_secs(24)),
+            (FanMode::Full, 800_000)
+        );
+    }
 
     fn sample(policy: &mut CoolingPolicy, temperature: i32, second: u64) -> FanMode {
         policy.update(Some(temperature), Duration::from_secs(second))

@@ -10,7 +10,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod cooling;
-use cooling::CoolingPolicy;
+mod power;
+mod profile;
+use cooling::{CoolingPolicy, QuietPolicy, QUIET_MIN_KHZ};
+use power::CpuPower;
+use profile::{OperatingMode, MODE_PATH, STATE_PATH};
 
 // MSI MPG CORELIQUID
 mod msi {
@@ -56,6 +60,9 @@ pub enum FanMode {
     Default = 4,
     /// Smart mode - adapts to CPU temperature
     Smart = 5,
+    /// Internal fixed low speeds; only selected together with Quiet CPU limits.
+    #[value(skip)]
+    Quiet = 6,
 }
 
 // LianLi UNI FAN AL V2 (from OpenRGB LianLiUniHubALController)
@@ -95,8 +102,8 @@ mod gpu {
 }
 
 #[derive(Parser)]
-#[command(name = "ledctl")]
-#[command(about = "Control RGB LEDs on various PC components")]
+#[command(name = "lights-out")]
+#[command(about = "Control component lighting and quiet/balanced CPU cooling")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -118,8 +125,13 @@ enum Commands {
         #[arg(value_enum)]
         mode: FanMode,
     },
-    /// Keep the cooler silent normally and increase cooling when the CPU is hot
+    /// Run Quiet (default) or Balanced cooling with CPU thermal control
     Daemon,
+    /// Show or select Quiet/Balanced mode (selection requires root and the daemon)
+    Mode {
+        #[arg(value_enum)]
+        mode: Option<OperatingMode>,
+    },
     /// Read cooler fan/pump RPM, duty and configured modes
     Status,
     /// Dump MSI cooler feature report (for debugging)
@@ -178,10 +190,18 @@ fn fan_mode_reports(mode: FanMode) -> [[u8; msi::HID_REPORT_LEN]; 2] {
     {
         report[0] = msi::CMD_PREFIX;
         report[1] = command;
-        for &offset in msi::FAN_MODE_OFFSETS {
-            report[offset] = mode as u8;
+        for (channel, &offset) in msi::FAN_MODE_OFFSETS.iter().enumerate() {
+            report[offset] = if mode == FanMode::Quiet {
+                3
+            } else {
+                mode as u8
+            };
             if mode == FanMode::Full && command == msi::CMD_FAN_MODE_1 {
                 report[offset + 1..offset + 8].fill(100);
+            }
+            if mode == FanMode::Quiet && command == msi::CMD_FAN_MODE_1 {
+                // liquidctl channel order: three radiator fans, waterblock fan, pump.
+                report[offset + 1..offset + 8].fill([35, 35, 35, 25, 70][channel]);
             }
         }
     }
@@ -274,68 +294,103 @@ fn msi_daemon(stop_flag: Arc<AtomicBool>) -> Result<()> {
         .open(msi::VID, msi::PID)
         .context("Failed to open MSI CORELIQUID")?;
 
-    // Never leave a cooler at a quiet setting if the sensor cannot be found.
-    let temp_path = match find_cpu_temp_path() {
-        Ok(path) => path,
-        Err(error) => {
-            set_fan_mode(&device, FanMode::Full)?;
-            return Err(error);
-        }
-    };
-    println!("  Found CPU temp sensor: {}", temp_path.display());
-    println!("  Cooling policy: Silent normally; Game at 80°C; Full at 85°C; Full to Game after 10 seconds below 80°C; Game to Silent after 15 seconds below 75°C");
+    let result = (|| -> Result<()> {
+        let temp_path = find_cpu_temp_path()?;
+        let cpu = CpuPower::discover()?;
+        println!("  Found CPU temp sensor: {}", temp_path.display());
+        println!("  Quiet: fixed low fans, CPU limited to 3.6 GHz or less; Balanced: full CPU range, cooling on demand");
+        println!("  Both modes retain the 85°C emergency and sensor-failure override");
 
-    let started = Instant::now();
-    let mut policy = CoolingPolicy::default();
-    let mut applied_mode = None;
-    let mut last_applied = Instant::now();
-    let mut last_logged = Instant::now();
+        let started = Instant::now();
+        let mut balanced = CoolingPolicy::default();
+        let mut quiet = QuietPolicy::default();
+        let mut selected_mode = None;
+        let mut applied_fan = None;
+        let mut last_applied = Instant::now();
+        let mut last_profile_check = Instant::now();
+        let mut last_logged = Instant::now();
+        let mut last_limit = None;
 
-    while !stop_flag.load(Ordering::Relaxed) {
-        let temperature = read_cpu_temp(&temp_path);
-        let mode = policy.update(temperature.as_ref().ok().copied(), started.elapsed());
-        let changed = applied_mode != Some(mode);
-        // Periodically reassert the policy after another program changes modes.
-        if changed || last_applied.elapsed() >= Duration::from_secs(10) {
-            if let Err(error) = set_fan_mode(&device, mode) {
-                let _ = set_fan_mode(&device, FanMode::Full);
-                return Err(error);
+        while !stop_flag.load(Ordering::Relaxed) {
+            let selected = profile::read_mode(Path::new(MODE_PATH))?;
+            let mode_changed = selected_mode != Some(selected);
+            if mode_changed {
+                balanced = CoolingPolicy::default();
+                quiet = QuietPolicy::default();
             }
-            applied_mode = Some(mode);
-            last_applied = Instant::now();
-        }
-        match temperature {
-            Ok(millidegrees) => {
-                if changed || last_logged.elapsed() >= Duration::from_secs(10) {
-                    println!(
-                        "  CPU Temperature: {:.1}°C; cooling: {mode:?}",
-                        millidegrees as f64 / 1000.0
-                    );
-                    last_logged = Instant::now();
+            let temperature = read_cpu_temp(&temp_path);
+            let sample = temperature.as_ref().ok().copied();
+            let (fan, quiet_limit) = match selected {
+                OperatingMode::Quiet => quiet.update(sample, started.elapsed()),
+                OperatingMode::Balanced => {
+                    (balanced.update(sample, started.elapsed()), QUIET_MIN_KHZ)
                 }
-                if let Err(error) = send_cpu_temp(&device, millidegrees / 1000) {
-                    let _ = set_fan_mode(&device, FanMode::Full);
-                    return Err(error);
-                }
+            };
+            // Emergency cooling must not wait for D-Bus/profile commands.
+            if fan == FanMode::Full && applied_fan != Some(FanMode::Full) {
+                set_fan_mode(&device, FanMode::Full)?;
+                applied_fan = Some(FanMode::Full);
+                last_applied = Instant::now();
             }
-            Err(error) => {
-                // Systemd retries sensor discovery, while full speed remains set.
-                return Err(error);
-            }
-        }
 
-        // Sleep for the interval, checking stop flag periodically
-        for _ in 0..(msi::DAEMON_INTERVAL_SECS * 10) {
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
+            // Restrict heat production before applying low fan speeds. Verify
+            // frequency limits every second, including after external changes.
+            if mode_changed || last_profile_check.elapsed() >= Duration::from_secs(10) {
+                if selected == OperatingMode::Quiet {
+                    cpu.apply_limit(selected, quiet_limit)?;
+                }
+                CpuPower::ensure_profile(selected)?;
+                last_profile_check = Instant::now();
             }
-            std::thread::sleep(Duration::from_millis(100));
+            cpu.apply_limit(selected, quiet_limit)?;
+            let fan_changed = applied_fan != Some(fan);
+            if fan_changed || last_applied.elapsed() >= Duration::from_secs(10) {
+                set_fan_mode(&device, fan)?;
+                applied_fan = Some(fan);
+                last_applied = Instant::now();
+            }
+            let millidegrees = temperature?;
+            send_cpu_temp(&device, millidegrees / 1000)?;
+            if mode_changed
+                || fan_changed
+                || last_limit != Some(quiet_limit)
+                || last_logged.elapsed() >= Duration::from_secs(10)
+            {
+                let cpu_limit = match selected {
+                    OperatingMode::Quiet => format!("{} MHz", quiet_limit / 1000),
+                    OperatingMode::Balanced => "hardware maximum".to_owned(),
+                };
+                let state = format!(
+                    "Mode: {}; CPU: {:.1}°C; cooling: {fan:?}; CPU ceiling: {cpu_limit}\n",
+                    selected.name(),
+                    millidegrees as f64 / 1000.0
+                );
+                print!("  {state}");
+                profile::atomic_write(Path::new(STATE_PATH), &state)?;
+                last_logged = Instant::now();
+            }
+            selected_mode = Some(selected);
+            last_limit = Some(quiet_limit);
+            for _ in 0..(msi::DAEMON_INTERVAL_SECS * 10) {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
+        Ok(())
+    })();
+
+    // A failed controller cannot promise quiet cooling safely. Reduce CPU heat
+    // if possible, and leave fixed full cooling for systemd's restart attempt.
+    if result.is_err() {
+        let _ = CpuPower::discover()
+            .and_then(|cpu| cpu.apply_limit(OperatingMode::Quiet, QUIET_MIN_KHZ));
     }
-
-    // A stopped daemon cannot keep providing fresh temperatures. Use a fixed
-    // duty that does not depend on the last (possibly cool) temperature sample.
-    set_fan_mode(&device, FanMode::Full)?;
+    let fallback = set_fan_mode(&device, FanMode::Full);
+    let _ = fs::remove_file(STATE_PATH);
+    result?;
+    fallback?;
     println!("  Daemon stopped; cooler left at full speed.");
     Ok(())
 }
@@ -366,6 +421,13 @@ fn read_cooler_report(device: &HidDevice, command: u8) -> Result<Vec<u8>> {
 }
 
 fn msi_status() -> Result<()> {
+    println!(
+        "Selected mode: {}",
+        profile::read_mode(Path::new(MODE_PATH))?.name()
+    );
+    if let Ok(state) = fs::read_to_string(STATE_PATH) {
+        print!("Last daemon report: {state}");
+    }
     let api = HidApi::new().context("Failed to initialize HID API")?;
     let device = api
         .open(msi::VID, msi::PID)
@@ -599,6 +661,24 @@ fn main() -> Result<()> {
 
             msi_daemon(stop_flag)
         }
+        Commands::Mode { mode } => {
+            if let Some(mode) = mode {
+                profile::atomic_write(Path::new(MODE_PATH), &format!("{}\n", mode.name()))?;
+                println!(
+                    "{} mode selected; the running daemon applies it within one polling interval.",
+                    mode.name()
+                );
+            } else {
+                println!(
+                    "Selected mode: {}",
+                    profile::read_mode(Path::new(MODE_PATH))?.name()
+                );
+                if let Ok(state) = fs::read_to_string(STATE_PATH) {
+                    print!("Last daemon report: {state}");
+                }
+            }
+            Ok(())
+        }
         Commands::Dump => msi_dump(),
         Commands::Status => msi_status(),
     }
@@ -618,6 +698,16 @@ mod tests {
                 &speeds[offset..offset + 8],
                 &[3, 100, 100, 100, 100, 100, 100, 100]
             );
+            assert_eq!(&temperatures[offset..offset + 8], &[3, 0, 0, 0, 0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn quiet_keeps_each_channel_at_a_fixed_low_duty() {
+        let [speeds, temperatures] = fan_mode_reports(FanMode::Quiet);
+        for (offset, duty) in [2, 10, 18, 26, 34].into_iter().zip([35, 35, 35, 25, 70]) {
+            assert_eq!(speeds[offset], 3);
+            assert_eq!(&speeds[offset + 1..offset + 8], &[duty; 7]);
             assert_eq!(&temperatures[offset..offset + 8], &[3, 0, 0, 0, 0, 0, 0, 0]);
         }
     }
