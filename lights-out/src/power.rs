@@ -108,7 +108,17 @@ impl CpuPower {
             if mode == OperatingMode::Balanced {
                 fs::write(policy.path.join("scaling_min_freq"), minimum.to_string())?;
             }
-            let actual = read_frequency(&policy.path.join("scaling_max_freq"))?;
+            // amd-pstate applies limit changes asynchronously on recent
+            // kernels: an immediate read can still return the previous
+            // ceiling. Give the update a moment before calling it a failure.
+            let mut actual = read_frequency(&policy.path.join("scaling_max_freq"))?;
+            for _ in 0..20 {
+                if actual == maximum {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                actual = read_frequency(&policy.path.join("scaling_max_freq"))?;
+            }
             ensure!(
                 actual == maximum,
                 "CPU frequency limit did not take effect: requested {maximum}, got {actual}"
