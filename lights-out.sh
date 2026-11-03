@@ -36,15 +36,48 @@ openrgb_off() {
     fi
 }
 
-openrgb_off "Corsair RAM (stick 1) -> black" --device 0 --mode Direct --color 000000
+# At boot this runs right after openrgb.service starts, while the server is
+# still detecting hardware: it may list only some devices, and commands sent
+# then get lost. Wait until the devices that are always installed (both RAM
+# sticks and the motherboard) are listed. The mouse is left out because its
+# dongle can be asleep or unplugged.
+RAM_NAME="Corsair Dominator Platinum RGB DDR5"
+BOARD_NAME="ASRock X670E Taichi"
+DETECT_TIMEOUT=90
 
-openrgb_off "Corsair RAM (stick 2) -> black" --device 1 --mode Direct --color 000000
+list_devices() {
+    openrgb --list-devices 2>/dev/null | grep -E '^[0-9]+: ' || true
+}
+
+ram_indices() {
+    list_devices | grep -F ": $RAM_NAME" | cut -d: -f1
+}
+
+deadline=$((SECONDS + DETECT_TIMEOUT))
+until [[ $(ram_indices | wc -l) -ge 2 ]] && list_devices | grep -qF ": $BOARD_NAME"; do
+    if ((SECONDS >= deadline)); then
+        echo "  Warning: OpenRGB still missing devices after ${DETECT_TIMEOUT}s; continuing with what it has"
+        break
+    fi
+    sleep 2
+done
+
+# Both sticks share a name, so address them by the indices the server
+# reports for that name.
+stick=0
+for index in $(ram_indices); do
+    stick=$((stick + 1))
+    openrgb_off "Corsair RAM (stick $stick) -> black" --device "$index" --mode Direct --color 000000
+done
+if ((stick == 0)); then
+    echo "  Warning: no Corsair RAM found in OpenRGB; continuing"
+fi
 
 openrgb_off "ASUS ROG Chakram X mouse -> black" --device "Asus ROG Chakram X 2.4GHz" --mode Direct --color 000000
 
 echo "  Red Square Keyrox keyboard -> (use Fn+Del manually)"
 
-openrgb_off "ASRock X670E Taichi motherboard -> off" --device "ASRock X670E Taichi" --mode Off
+openrgb_off "ASRock X670E Taichi motherboard -> off" --device "$BOARD_NAME" --mode Off
 
 echo ""
 echo "=== Summary ==="
