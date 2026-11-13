@@ -310,6 +310,7 @@ fn msi_daemon(stop_flag: Arc<AtomicBool>) -> Result<()> {
         let mut last_profile_check = Instant::now();
         let mut last_logged = Instant::now();
         let mut last_limit = None;
+        let mut last_published = Instant::now() - Duration::from_secs(60);
 
         while !stop_flag.load(Ordering::Relaxed) {
             let selected = profile::read_mode(Path::new(MODE_PATH))?;
@@ -353,6 +354,14 @@ fn msi_daemon(stop_flag: Arc<AtomicBool>) -> Result<()> {
             }
             let millidegrees = temperature?;
             send_cpu_temp(&device, millidegrees / 1000)?;
+            // Publish the fan/pump readings for monitors; never let a failed
+            // read interfere with cooling control.
+            if last_published.elapsed() >= Duration::from_secs(2) {
+                if let Err(error) = publish_cooler(&device, selected.name(), &format!("{fan:?}"), millidegrees as f64 / 1000.0) {
+                    eprintln!("  Cooler status not published: {error:#}");
+                }
+                last_published = Instant::now();
+            }
             if mode_changed
                 || fan_changed
                 || last_limit != Some(quiet_limit)
@@ -391,10 +400,52 @@ fn msi_daemon(stop_flag: Arc<AtomicBool>) -> Result<()> {
     }
     let fallback = set_fan_mode(&device, FanMode::Full);
     let _ = fs::remove_file(STATE_PATH);
+    let _ = fs::remove_file(COOLER_PATH);
     result?;
     fallback?;
     println!("  Daemon stopped; cooler left at full speed.");
     Ok(())
+}
+
+/// Where the daemon publishes the cooler's live readings for monitors
+/// (world-readable JSON; liquidctl no longer drives this cooler).
+const COOLER_PATH: &str = "/run/lights-out/cooler.json";
+
+/// Fan/pump channels from a 0x31 status report: (name, rpm, duty %).
+/// Channel order follows the liquidctl MSI driver (the protocol document's
+/// pump/waterblock labels are reversed).
+fn cooler_channels(status: &[u8]) -> Vec<(&'static str, u16, u16)> {
+    ["Radiator fan 1", "Radiator fan 2", "Radiator fan 3", "Waterblock fan", "Pump"]
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let rpm_offset = 2 + index * 2;
+            let duty_offset = 22 + index * 2;
+            let rpm = u16::from_le_bytes([status[rpm_offset], status[rpm_offset + 1]]);
+            let duty = u16::from_le_bytes([status[duty_offset], status[duty_offset + 1]]);
+            (*name, rpm, duty)
+        })
+        .collect()
+}
+
+/// Reads the cooler's status and writes it to COOLER_PATH as JSON:
+/// {"device", "mode", "cooling", "cpu", "updated", "channels": [{"name", "rpm", "duty"}]}.
+fn publish_cooler(device: &HidDevice, mode: &str, cooling: &str, cpu_celsius: f64) -> Result<()> {
+    let status = read_cooler_report(device, 0x31)?;
+    ensure!(status.len() >= 32, "Short cooler status reply");
+    let channels: Vec<String> = cooler_channels(&status)
+        .iter()
+        .map(|(name, rpm, duty)| format!(r#"{{"name":"{name}","rpm":{rpm},"duty":{duty}}}"#))
+        .collect();
+    let updated = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let json = format!(
+        r#"{{"device":"MSI MPG CORELIQUID","mode":"{mode}","cooling":"{cooling}","cpu":{cpu_celsius:.1},"updated":{updated},"channels":[{}]}}"#,
+        channels.join(",")
+    );
+    profile::atomic_write(Path::new(COOLER_PATH), &(json + "\n"))
 }
 
 fn read_cooler_report(device: &HidDevice, command: u8) -> Result<Vec<u8>> {
@@ -441,23 +492,8 @@ fn msi_status() -> Result<()> {
         status.len() >= 32 && speeds.len() >= 42 && temperatures.len() >= 42,
         "Short cooler status reply"
     );
-    // Channel order follows the liquidctl MSI driver (the protocol document's
-    // pump/waterblock labels are reversed).
-    for (index, name) in [
-        "Radiator fan 1",
-        "Radiator fan 2",
-        "Radiator fan 3",
-        "Waterblock fan",
-        "Pump",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let rpm_offset = 2 + index * 2;
-        let duty_offset = 22 + index * 2;
+    for (index, (name, rpm, duty)) in cooler_channels(&status).into_iter().enumerate() {
         let mode_offset = 2 + index * 8;
-        let rpm = u16::from_le_bytes([status[rpm_offset], status[rpm_offset + 1]]);
-        let duty = u16::from_le_bytes([status[duty_offset], status[duty_offset + 1]]);
         println!(
             "  {name}: {rpm} RPM, {duty}% duty, speed mode {}, temperature mode {}",
             speeds[mode_offset], temperatures[mode_offset]
