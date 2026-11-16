@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 mod cooling;
 mod power;
 mod profile;
+mod ram;
 use cooling::{CoolingPolicy, QuietPolicy, QUIET_MIN_KHZ};
 use power::CpuPower;
 use profile::{OperatingMode, MODE_PATH, STATE_PATH};
@@ -696,6 +697,9 @@ fn main() -> Result<()> {
                 stop_flag_clone.store(true, Ordering::Relaxed);
             })
             .context("Failed to set signal handler")?;
+
+            let ram_stop = stop_flag.clone();
+            std::thread::spawn(move || ram::keep_dark(ram_stop));
 
             msi_daemon(stop_flag)
         }

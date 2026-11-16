@@ -55,7 +55,7 @@
             # Install the Rust binary
             cp ${lights-out-bin}/bin/lights-out $out/bin/lights-out
             wrapProgram $out/bin/lights-out \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.power-profiles-daemon ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.power-profiles-daemon pkgs.openrgb ]}
 
             mkdir -p $out/share/applications
             for mode in quiet balanced; do
